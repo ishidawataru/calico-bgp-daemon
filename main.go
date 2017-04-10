@@ -108,6 +108,7 @@ type Server struct {
 	ipv4      net.IP
 	ipv6      net.IP
 	ipam      *ipamCache
+	rib       *RIB
 }
 
 func NewServer() (*Server, error) {
@@ -156,6 +157,7 @@ func NewServer() (*Server, error) {
 		etcd:      etcdCli,
 		ipv4:      ipv4,
 		ipv6:      ipv6,
+		rib:       NewRIB(),
 	}, nil
 }
 
@@ -720,19 +722,39 @@ func (s *Server) watchBGPConfig() error {
 // watchKernelRoute receives netlink route update notification and announces
 // kernel/boot routes using BGP.
 func (s *Server) watchKernelRoute() error {
+
+	routes, err := netlink.RouteList(nil, 0)
+	if err != nil {
+		return err
+	}
+	for _, route := range routes {
+		if route.Table == syscall.RT_TABLE_MAIN && (route.Protocol == syscall.RTPROT_KERNEL || route.Protocol == syscall.RTPROT_BOOT) {
+			dst := "0.0.0.0/0"
+			if route.Dst != nil {
+				dst = route.Dst.String()
+			}
+			s.rib.Add(dst, route)
+		}
+	}
 	ch := make(chan netlink.RouteUpdate)
-	err := netlink.RouteSubscribe(ch, nil)
+	err = netlink.RouteSubscribe(ch, nil)
 	if err != nil {
 		return err
 	}
 	for update := range ch {
 		log.Printf("kernel update: %s", update)
+		dst := "0.0.0.0/0"
+		if update.Dst != nil {
+			dst = update.Dst.String()
+		}
 		if update.Table == syscall.RT_TABLE_MAIN && (update.Protocol == syscall.RTPROT_KERNEL || update.Protocol == syscall.RTPROT_BOOT) {
 			isWithdrawal := false
 			switch update.Type {
 			case syscall.RTM_DELROUTE:
 				isWithdrawal = true
+				s.rib.Delete(dst)
 			case syscall.RTM_NEWROUTE:
+				s.rib.Add(dst, update.Route)
 			default:
 				log.Printf("unhandled rtm type: %d", update.Type)
 				continue
@@ -756,6 +778,17 @@ func (s *Server) injectRoute(path *bgptable.Path) error {
 	nexthop := path.GetNexthop()
 	nlri := path.GetNlri()
 	dst, _ := netlink.ParseIPNet(nlri.String())
+	len := 128
+	if dst.IP.To4() != nil {
+		len = 32
+	}
+	n, err := s.rib.Get(fmt.Sprintf("%s/%d", nexthop.String(), len))
+	if err != nil {
+		return err
+	}
+	if gw := n.(*netlink.Route).Gw; gw != nil {
+		nexthop = gw
+	}
 	route := &netlink.Route{
 		Dst:      dst,
 		Gw:       nexthop,
@@ -867,7 +900,7 @@ func (s *Server) initialPolicySetting() error {
 	}
 	return s.bgpServer.AddPolicyAssignment("", bgptable.POLICY_DIRECTION_EXPORT,
 		[]*bgpconfig.PolicyDefinition{&definition},
-		bgptable.ROUTE_TYPE_ACCEPT)
+		bgptable.ROUTE_TYPE_REJECT)
 }
 
 func (s *Server) updatePrefixSet(paths []*bgptable.Path) error {
@@ -952,7 +985,7 @@ func main() {
 		os.Exit(0)
 	}
 
-	logrus.SetLevel(logrus.InfoLevel)
+	logrus.SetLevel(logrus.DebugLevel)
 
 	server, err := NewServer()
 	if err != nil {
